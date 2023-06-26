@@ -17,27 +17,28 @@ impl Migrator {
         Migrator { path }
     }
 
-    // TODO: return Result
-    pub fn migrate(&self, conn: &mut Client) {
+    pub fn migrate(&self, conn: &mut Client) -> Result<(), postgres::Error> {
         let table = MigrationsTable::new("migrations");
-        table.create(conn).unwrap(); // TODO: handle
+        table.create(conn)?;
 
         for file in self.files() {
-            if !table.was_migration_applied(conn, &file) {
-                table.apply_migration(conn, &file);
+            if !table.was_migration_applied(conn, &file)? {
+                table.apply_migration(conn, &file)?;
             }
         }
+
+        Ok(())
     }
 
     fn files(&self) -> Vec<MigrationFile> {
         let mut migration_files: Vec<MigrationFile> = Vec::new();
 
-        if let Ok(files) = fs::read_dir(&self.path) {
-            for file in files {
-                let file = file.unwrap();
-
-                if let Some(file) = MigrationFile::from(file) {
-                    migration_files.push(file)
+        if let Ok(entries) = fs::read_dir(&self.path) {
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    if let Some(file) = MigrationFile::from(entry) {
+                        migration_files.push(file)
+                    }
                 }
             }
         }
@@ -48,7 +49,7 @@ impl Migrator {
     }
 }
 
-#[derive(Eq)]
+#[derive(Eq, Debug)]
 struct MigrationFile {
     base_path: PathBuf,
     filename: String,
@@ -80,29 +81,44 @@ impl MigrationsTable {
         conn.batch_execute(&stmt)
     }
 
-    pub fn was_migration_applied(&self, conn: &mut Client, file: &MigrationFile) -> bool {
+    pub fn was_migration_applied(
+        &self,
+        conn: &mut Client,
+        file: &MigrationFile,
+    ) -> Result<bool, postgres::Error> {
         let query = format!(
             "SELECT COUNT(id) AS count FROM {table_name} WHERE id = $1",
             table_name = self.table_name
         );
 
-        let result = conn.query_one(&query, &[&file.id]).unwrap(); // TODO
+        let result = conn.query_one(&query, &[&file.id])?;
         let count: i64 = result.get("count");
 
-        count != 0
+        Ok(count != 0)
     }
 
-    pub fn apply_migration(&self, conn: &mut Client, file: &MigrationFile) {
-        let mut transaction = conn.transaction().unwrap();
-        transaction.batch_execute(&file.contents()).unwrap();
+    pub fn apply_migration(
+        &self,
+        conn: &mut Client,
+        file: &MigrationFile,
+    ) -> Result<(), postgres::Error> {
+        let mut transaction = conn.transaction()?;
+
+        let stmt = file
+            .contents()
+            .expect(&format!("Could not read contents of file: {:?}", file));
+
+        transaction.batch_execute(&stmt)?;
 
         let stmt = format!(
             "INSERT INTO {table_name} (id) VALUES ($1)",
             table_name = self.table_name
         );
 
-        transaction.execute(&stmt, &[&file.id]).unwrap();
-        transaction.commit().unwrap();
+        transaction.execute(&stmt, &[&file.id])?;
+        transaction.commit()?;
+
+        Ok(())
     }
 }
 
@@ -113,11 +129,11 @@ impl MigrationFile {
                 return None;
             }
 
+            let pattern = Regex::new(r"^(\d{3})_[^.]+\.sql$").unwrap();
+
             let base_path = possible.path().parent().unwrap().to_path_buf();
             let filename = possible.file_name();
             let filename = filename.to_str().unwrap();
-
-            let pattern = Regex::new(r"^(\d{3})_[^.]+\.sql$").unwrap();
 
             if let Some(captures) = pattern.captures(filename) {
                 let id = captures.get(1).unwrap().as_str();
@@ -133,15 +149,15 @@ impl MigrationFile {
         None
     }
 
-    pub fn contents(&self) -> String {
+    pub fn contents(&self) -> Result<String, std::io::Error> {
         let path = Path::new(&self.base_path).join(&self.filename);
 
         let mut contents = String::new();
-        let mut file = File::open(&path).expect("Dude");
+        let mut file = File::open(&path)?;
 
-        file.read_to_string(&mut contents).expect("hwyyy");
+        file.read_to_string(&mut contents)?;
 
-        contents
+        Ok(contents)
     }
 }
 
